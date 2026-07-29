@@ -35,6 +35,127 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// exclusive: an exclusive lock can't be acquired while an exclusive or shared
 /// lock exists, and a shared lock can't be acquire while an exclusive lock
 /// exists.
+pub unsafe trait RawRwLockCore {
+    /// Marker type which determines whether a lock guard should be `Send`. Use
+    /// one of the `GuardSend` or `GuardNoSend` helper types here.
+    type GuardMarker;
+
+    /// Acquires a shared lock, blocking the current thread until it is able to do so.
+    fn lock_shared(&self);
+
+    /// Attempts to acquire a shared lock without blocking.
+    fn try_lock_shared(&self) -> bool;
+
+    /// Releases a shared lock.
+    ///
+    /// # Safety
+    ///
+    /// This method may only be called if a shared lock is held in the current context.
+    unsafe fn unlock_shared(&self);
+
+    /// Acquires an exclusive lock, blocking the current thread until it is able to do so.
+    fn lock_exclusive(&self);
+
+    /// Attempts to acquire an exclusive lock without blocking.
+    fn try_lock_exclusive(&self) -> bool;
+
+    /// Releases an exclusive lock.
+    ///
+    /// # Safety
+    ///
+    /// This method may only be called if an exclusive lock is held in the current context.
+    unsafe fn unlock_exclusive(&self);
+
+    /// Checks if this `RwLock` is currently locked in any way.
+    #[inline]
+    fn is_locked(&self) -> bool {
+        let acquired_lock = self.try_lock_exclusive();
+        if acquired_lock {
+            // Safety: A lock was successfully acquired above.
+            unsafe {
+                self.unlock_exclusive();
+            }
+        }
+        !acquired_lock
+    }
+
+    /// Check if this `RwLock` is currently exclusively locked.
+    fn is_locked_exclusive(&self) -> bool {
+        let acquired_lock = self.try_lock_shared();
+        if acquired_lock {
+            // Safety: A shared lock was successfully acquired above.
+            unsafe {
+                self.unlock_shared();
+            }
+        }
+        !acquired_lock
+    }
+}
+
+unsafe impl<R: RawRwLock> RawRwLockCore for R {
+    type GuardMarker = <Self as RawRwLock>::GuardMarker;
+
+    fn lock_shared(&self) {
+        <Self as RawRwLock>::lock_shared(self);
+    }
+
+    fn try_lock_shared(&self) -> bool {
+        <Self as RawRwLock>::try_lock_shared(self)
+    }
+
+    unsafe fn unlock_shared(&self) {
+        unsafe {
+            <Self as RawRwLock>::unlock_shared(self);
+        }
+    }
+
+    fn lock_exclusive(&self) {
+        <Self as RawRwLock>::lock_exclusive(self);
+    }
+
+    fn try_lock_exclusive(&self) -> bool {
+        <Self as RawRwLock>::try_lock_exclusive(self)
+    }
+
+    unsafe fn unlock_exclusive(&self) {
+        unsafe {
+            <Self as RawRwLock>::unlock_exclusive(self);
+        }
+    }
+
+    fn is_locked(&self) -> bool {
+        <Self as RawRwLock>::is_locked(self)
+    }
+
+    fn is_locked_exclusive(&self) -> bool {
+        <Self as RawRwLock>::is_locked_exclusive(self)
+    }
+}
+
+/// Provides a constant default value for an unlocked reader-writer lock.
+pub unsafe trait RawRwLockInit {
+    /// Initial value for an unlocked `RwLock`.
+    // A “non-constant” const item is a legacy way to supply an initialized value to downstream
+    // static items. Can hopefully be replaced with `const fn new() -> Self` at some point.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: Self;
+}
+
+unsafe impl<R: RawRwLock> RawRwLockInit for R {
+    const INIT: Self = <Self as RawRwLock>::INIT;
+}
+
+/// Basic operations for a reader-writer lock.
+///
+/// Types implementing this trait can be used by `RwLock` to form a safe and
+/// fully-functioning `RwLock` type.
+///
+/// # Safety
+///
+/// Implementations of this trait must ensure that the `RwLock` is actually
+/// exclusive: an exclusive lock can't be acquired while an exclusive or shared
+/// lock exists, and a shared lock can't be acquire while an exclusive lock
+/// exists.
 pub unsafe trait RawRwLock {
     /// Initial value for an unlocked `RwLock`.
     // A “non-constant” const item is a legacy way to supply an initialized value to downstream
@@ -104,7 +225,7 @@ pub unsafe trait RawRwLock {
 /// thread if there is one, without giving other threads the opportunity to
 /// "steal" the lock in the meantime. This is typically slower than unfair
 /// unlocking, but may be necessary in certain circumstances.
-pub unsafe trait RawRwLockFair: RawRwLock {
+pub unsafe trait RawRwLockFair: RawRwLockCore {
     /// Releases a shared lock using a fair unlock protocol.
     ///
     /// # Safety
@@ -150,7 +271,7 @@ pub unsafe trait RawRwLockFair: RawRwLock {
 
 /// Additional methods for `RwLock`s which support atomically downgrading an
 /// exclusive lock to a shared lock.
-pub unsafe trait RawRwLockDowngrade: RawRwLock {
+pub unsafe trait RawRwLockDowngrade: RawRwLockCore {
     /// Atomically downgrades an exclusive lock into a shared lock without
     /// allowing any thread to take an exclusive lock in the meantime.
     ///
@@ -164,7 +285,7 @@ pub unsafe trait RawRwLockDowngrade: RawRwLock {
 ///
 /// The `Duration` and `Instant` types are specified as associated types so that
 /// this trait is usable even in `no_std` environments.
-pub unsafe trait RawRwLockTimed: RawRwLock {
+pub unsafe trait RawRwLockTimed: RawRwLockCore {
     /// Duration type used for `try_lock_for`.
     type Duration;
 
@@ -191,7 +312,7 @@ pub unsafe trait RawRwLockTimed: RawRwLock {
 /// to recursively lock a `RwLock`. However using this method can cause
 /// writers to starve since readers no longer block if a writer is waiting
 /// for the lock.
-pub unsafe trait RawRwLockRecursive: RawRwLock {
+pub unsafe trait RawRwLockRecursive: RawRwLockCore {
     /// Acquires a shared lock without deadlocking in case of a recursive lock.
     fn lock_shared_recursive(&self);
 
@@ -216,7 +337,7 @@ pub unsafe trait RawRwLockRecursiveTimed: RawRwLockRecursive + RawRwLockTimed {
 /// This requires acquiring a special "upgradable read lock" instead of a
 /// normal shared lock. There may only be one upgradable lock at any time,
 /// otherwise deadlocks could occur when upgrading.
-pub unsafe trait RawRwLockUpgrade: RawRwLock {
+pub unsafe trait RawRwLockUpgrade: RawRwLockCore {
     /// Acquires an upgradable lock, blocking the current thread until it is able to do so.
     fn lock_upgradable(&self);
 
@@ -336,7 +457,7 @@ pub struct RwLock<R, T: ?Sized> {
 #[cfg(feature = "serde")]
 impl<R, T> Serialize for RwLock<R, T>
 where
-    R: RawRwLock,
+    R: RawRwLockCore,
     T: Serialize + ?Sized,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -350,7 +471,7 @@ where
 #[cfg(feature = "serde")]
 impl<'de, R, T> Deserialize<'de> for RwLock<R, T>
 where
-    R: RawRwLock,
+    R: RawRwLockInit,
     T: Deserialize<'de> + ?Sized,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -361,10 +482,10 @@ where
     }
 }
 
-unsafe impl<R: RawRwLock + Send, T: ?Sized + Send> Send for RwLock<R, T> {}
-unsafe impl<R: RawRwLock + Sync, T: ?Sized + Send + Sync> Sync for RwLock<R, T> {}
+unsafe impl<R: RawRwLockCore + Send, T: ?Sized + Send> Send for RwLock<R, T> {}
+unsafe impl<R: RawRwLockCore + Sync, T: ?Sized + Send + Sync> Sync for RwLock<R, T> {}
 
-impl<R: RawRwLock, T> RwLock<R, T> {
+impl<R: RawRwLockInit, T> RwLock<R, T> {
     /// Creates a new instance of an `RwLock<T>` which is unlocked.
     #[inline]
     pub const fn new(val: T) -> RwLock<R, T> {
@@ -373,7 +494,9 @@ impl<R: RawRwLock, T> RwLock<R, T> {
             raw: R::INIT,
         }
     }
+}
 
+impl<R: RawRwLockCore, T> RwLock<R, T> {
     /// Consumes this `RwLock`, returning the underlying data.
     #[inline]
     #[allow(unused_unsafe)]
@@ -406,7 +529,7 @@ impl<R, T> RwLock<R, T> {
     }
 }
 
-impl<R: RawRwLock, T: ?Sized> RwLock<R, T> {
+impl<R: RawRwLockCore, T: ?Sized> RwLock<R, T> {
     /// Creates a new `RwLockReadGuard` without checking if the lock is held.
     ///
     /// # Safety
@@ -571,7 +694,7 @@ impl<R: RawRwLock, T: ?Sized> RwLock<R, T> {
 
     /// Returns the underlying raw reader-writer lock object.
     ///
-    /// Note that you will most likely need to import the `RawRwLock` trait from
+    /// Note that you will most likely need to import the `RawRwLockCore` trait from
     /// `lock_api` to be able to call functions on the raw
     /// reader-writer lock.
     ///
@@ -1218,21 +1341,21 @@ impl<R: RawRwLockUpgradeTimed, T: ?Sized> RwLock<R, T> {
     }
 }
 
-impl<R: RawRwLock, T: ?Sized + Default> Default for RwLock<R, T> {
+impl<R: RawRwLockInit, T: ?Sized + Default> Default for RwLock<R, T> {
     #[inline]
     fn default() -> RwLock<R, T> {
         RwLock::new(Default::default())
     }
 }
 
-impl<R: RawRwLock, T> From<T> for RwLock<R, T> {
+impl<R: RawRwLockInit, T> From<T> for RwLock<R, T> {
     #[inline]
     fn from(t: T) -> RwLock<R, T> {
         RwLock::new(t)
     }
 }
 
-impl<R: RawRwLock, T: ?Sized + fmt::Debug> fmt::Debug for RwLock<R, T> {
+impl<R: RawRwLockCore, T: ?Sized + fmt::Debug> fmt::Debug for RwLock<R, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut d = f.debug_struct("RwLock");
         match self.try_read() {
@@ -1250,14 +1373,14 @@ impl<R: RawRwLock, T: ?Sized + fmt::Debug> fmt::Debug for RwLock<R, T> {
 /// dropped.
 #[clippy::has_significant_drop]
 #[must_use = "if unused the RwLock will immediately unlock"]
-pub struct RwLockReadGuard<'a, R: RawRwLock, T: ?Sized> {
+pub struct RwLockReadGuard<'a, R: RawRwLockCore, T: ?Sized> {
     rwlock: &'a RwLock<R, T>,
     marker: PhantomData<(&'a T, R::GuardMarker)>,
 }
 
-unsafe impl<R: RawRwLock + Sync, T: Sync + ?Sized> Sync for RwLockReadGuard<'_, R, T> {}
+unsafe impl<R: RawRwLockCore + Sync, T: Sync + ?Sized> Sync for RwLockReadGuard<'_, R, T> {}
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> RwLockReadGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> RwLockReadGuard<'a, R, T> {
     /// Returns a reference to the original reader-writer lock object.
     pub fn rwlock(s: &Self) -> &'a RwLock<R, T> {
         s.rwlock
@@ -1421,7 +1544,7 @@ impl<'a, R: RawRwLockFair + 'a, T: ?Sized + 'a> RwLockReadGuard<'a, R, T> {
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Deref for RwLockReadGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> Deref for RwLockReadGuard<'a, R, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -1429,7 +1552,7 @@ impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Deref for RwLockReadGuard<'a, R, T> 
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Drop for RwLockReadGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> Drop for RwLockReadGuard<'a, R, T> {
     #[inline]
     fn drop(&mut self) {
         // Safety: An RwLockReadGuard always holds a shared lock.
@@ -1439,13 +1562,15 @@ impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Drop for RwLockReadGuard<'a, R, T> {
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug for RwLockReadGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug
+    for RwLockReadGuard<'a, R, T>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
+impl<'a, R: RawRwLockCore + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
     for RwLockReadGuard<'a, R, T>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1454,7 +1579,7 @@ impl<'a, R: RawRwLock + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
 }
 
 #[cfg(feature = "owning_ref")]
-unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> StableAddress for RwLockReadGuard<'a, R, T> {}
+unsafe impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> StableAddress for RwLockReadGuard<'a, R, T> {}
 
 /// An RAII rwlock guard returned by the `Arc` locking operations on `RwLock`.
 ///
@@ -1463,13 +1588,13 @@ unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> StableAddress for RwLockReadG
 #[cfg(feature = "arc_lock")]
 #[clippy::has_significant_drop]
 #[must_use = "if unused the RwLock will immediately unlock"]
-pub struct ArcRwLockReadGuard<R: RawRwLock, T: ?Sized> {
+pub struct ArcRwLockReadGuard<R: RawRwLockCore, T: ?Sized> {
     rwlock: Arc<RwLock<R, T>>,
     marker: PhantomData<R::GuardMarker>,
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: ?Sized> ArcRwLockReadGuard<R, T> {
+impl<R: RawRwLockCore, T: ?Sized> ArcRwLockReadGuard<R, T> {
     /// Returns a reference to the rwlock, contained in its `Arc`.
     pub fn rwlock(s: &Self) -> &Arc<RwLock<R, T>> {
         &s.rwlock
@@ -1557,7 +1682,7 @@ impl<R: RawRwLockFair, T: ?Sized> ArcRwLockReadGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: ?Sized> Deref for ArcRwLockReadGuard<R, T> {
+impl<R: RawRwLockCore, T: ?Sized> Deref for ArcRwLockReadGuard<R, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -1566,7 +1691,7 @@ impl<R: RawRwLock, T: ?Sized> Deref for ArcRwLockReadGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: ?Sized> Drop for ArcRwLockReadGuard<R, T> {
+impl<R: RawRwLockCore, T: ?Sized> Drop for ArcRwLockReadGuard<R, T> {
     #[inline]
     fn drop(&mut self) {
         // Safety: An RwLockReadGuard always holds a shared lock.
@@ -1577,14 +1702,14 @@ impl<R: RawRwLock, T: ?Sized> Drop for ArcRwLockReadGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: fmt::Debug + ?Sized> fmt::Debug for ArcRwLockReadGuard<R, T> {
+impl<R: RawRwLockCore, T: fmt::Debug + ?Sized> fmt::Debug for ArcRwLockReadGuard<R, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: fmt::Display + ?Sized> fmt::Display for ArcRwLockReadGuard<R, T> {
+impl<R: RawRwLockCore, T: fmt::Display + ?Sized> fmt::Display for ArcRwLockReadGuard<R, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
     }
@@ -1594,14 +1719,14 @@ impl<R: RawRwLock, T: fmt::Display + ?Sized> fmt::Display for ArcRwLockReadGuard
 /// dropped.
 #[clippy::has_significant_drop]
 #[must_use = "if unused the RwLock will immediately unlock"]
-pub struct RwLockWriteGuard<'a, R: RawRwLock, T: ?Sized> {
+pub struct RwLockWriteGuard<'a, R: RawRwLockCore, T: ?Sized> {
     rwlock: &'a RwLock<R, T>,
     marker: PhantomData<(&'a mut T, R::GuardMarker)>,
 }
 
-unsafe impl<R: RawRwLock + Sync, T: Sync + ?Sized> Sync for RwLockWriteGuard<'_, R, T> {}
+unsafe impl<R: RawRwLockCore + Sync, T: Sync + ?Sized> Sync for RwLockWriteGuard<'_, R, T> {}
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> RwLockWriteGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> RwLockWriteGuard<'a, R, T> {
     /// Returns a reference to the original reader-writer lock object.
     pub fn rwlock(s: &Self) -> &'a RwLock<R, T> {
         s.rwlock
@@ -1809,7 +1934,7 @@ impl<'a, R: RawRwLockFair + 'a, T: ?Sized + 'a> RwLockWriteGuard<'a, R, T> {
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Deref for RwLockWriteGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> Deref for RwLockWriteGuard<'a, R, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -1817,14 +1942,14 @@ impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Deref for RwLockWriteGuard<'a, R, T>
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> DerefMut for RwLockWriteGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> DerefMut for RwLockWriteGuard<'a, R, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.rwlock.data.get() }
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Drop for RwLockWriteGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> Drop for RwLockWriteGuard<'a, R, T> {
     #[inline]
     fn drop(&mut self) {
         // Safety: An RwLockWriteGuard always holds an exclusive lock.
@@ -1834,13 +1959,15 @@ impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Drop for RwLockWriteGuard<'a, R, T> 
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug for RwLockWriteGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug
+    for RwLockWriteGuard<'a, R, T>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
+impl<'a, R: RawRwLockCore + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
     for RwLockWriteGuard<'a, R, T>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1849,7 +1976,10 @@ impl<'a, R: RawRwLock + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
 }
 
 #[cfg(feature = "owning_ref")]
-unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> StableAddress for RwLockWriteGuard<'a, R, T> {}
+unsafe impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> StableAddress
+    for RwLockWriteGuard<'a, R, T>
+{
+}
 
 /// An RAII rwlock guard returned by the `Arc` locking operations on `RwLock`.
 /// This is similar to the `RwLockWriteGuard` struct, except instead of using a reference to unlock the `RwLock`
@@ -1857,13 +1987,13 @@ unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> StableAddress for RwLockWrite
 #[cfg(feature = "arc_lock")]
 #[clippy::has_significant_drop]
 #[must_use = "if unused the RwLock will immediately unlock"]
-pub struct ArcRwLockWriteGuard<R: RawRwLock, T: ?Sized> {
+pub struct ArcRwLockWriteGuard<R: RawRwLockCore, T: ?Sized> {
     rwlock: Arc<RwLock<R, T>>,
     marker: PhantomData<R::GuardMarker>,
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: ?Sized> ArcRwLockWriteGuard<R, T> {
+impl<R: RawRwLockCore, T: ?Sized> ArcRwLockWriteGuard<R, T> {
     /// Returns a reference to the rwlock, contained in its `Arc`.
     pub fn rwlock(s: &Self) -> &Arc<RwLock<R, T>> {
         &s.rwlock
@@ -1999,7 +2129,7 @@ impl<R: RawRwLockFair, T: ?Sized> ArcRwLockWriteGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: ?Sized> Deref for ArcRwLockWriteGuard<R, T> {
+impl<R: RawRwLockCore, T: ?Sized> Deref for ArcRwLockWriteGuard<R, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -2008,7 +2138,7 @@ impl<R: RawRwLock, T: ?Sized> Deref for ArcRwLockWriteGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: ?Sized> DerefMut for ArcRwLockWriteGuard<R, T> {
+impl<R: RawRwLockCore, T: ?Sized> DerefMut for ArcRwLockWriteGuard<R, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.rwlock.data.get() }
@@ -2016,7 +2146,7 @@ impl<R: RawRwLock, T: ?Sized> DerefMut for ArcRwLockWriteGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: ?Sized> Drop for ArcRwLockWriteGuard<R, T> {
+impl<R: RawRwLockCore, T: ?Sized> Drop for ArcRwLockWriteGuard<R, T> {
     #[inline]
     fn drop(&mut self) {
         // Safety: An RwLockWriteGuard always holds an exclusive lock.
@@ -2027,14 +2157,14 @@ impl<R: RawRwLock, T: ?Sized> Drop for ArcRwLockWriteGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: fmt::Debug + ?Sized> fmt::Debug for ArcRwLockWriteGuard<R, T> {
+impl<R: RawRwLockCore, T: fmt::Debug + ?Sized> fmt::Debug for ArcRwLockWriteGuard<R, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawRwLock, T: fmt::Display + ?Sized> fmt::Display for ArcRwLockWriteGuard<R, T> {
+impl<R: RawRwLockCore, T: fmt::Display + ?Sized> fmt::Display for ArcRwLockWriteGuard<R, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
     }
@@ -2792,19 +2922,24 @@ impl<R: RawRwLockUpgrade, T: fmt::Display + ?Sized> fmt::Display
 /// thread.
 #[clippy::has_significant_drop]
 #[must_use = "if unused the RwLock will immediately unlock"]
-pub struct MappedRwLockReadGuard<'a, R: RawRwLock, T: ?Sized> {
+pub struct MappedRwLockReadGuard<'a, R: RawRwLockCore, T: ?Sized> {
     raw: &'a R,
     data: *const T,
     marker: PhantomData<&'a T>,
 }
 
-unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + Sync + 'a> Sync for MappedRwLockReadGuard<'a, R, T> {}
-unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + Sync + 'a> Send for MappedRwLockReadGuard<'a, R, T> where
-    R::GuardMarker: Send
+unsafe impl<'a, R: RawRwLockCore + 'a, T: ?Sized + Sync + 'a> Sync
+    for MappedRwLockReadGuard<'a, R, T>
+{
+}
+unsafe impl<'a, R: RawRwLockCore + 'a, T: ?Sized + Sync + 'a> Send
+    for MappedRwLockReadGuard<'a, R, T>
+where
+    R::GuardMarker: Send,
 {
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> MappedRwLockReadGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> MappedRwLockReadGuard<'a, R, T> {
     /// Make a new `MappedRwLockReadGuard` for a component of the locked data.
     ///
     /// This operation cannot fail as the `MappedRwLockReadGuard` passed
@@ -2911,7 +3046,7 @@ impl<'a, R: RawRwLockFair + 'a, T: ?Sized + 'a> MappedRwLockReadGuard<'a, R, T> 
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Deref for MappedRwLockReadGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> Deref for MappedRwLockReadGuard<'a, R, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -2919,7 +3054,7 @@ impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Deref for MappedRwLockReadGuard<'a, 
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Drop for MappedRwLockReadGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> Drop for MappedRwLockReadGuard<'a, R, T> {
     #[inline]
     fn drop(&mut self) {
         // Safety: A MappedRwLockReadGuard always holds a shared lock.
@@ -2929,7 +3064,7 @@ impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Drop for MappedRwLockReadGuard<'a, R
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug
+impl<'a, R: RawRwLockCore + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug
     for MappedRwLockReadGuard<'a, R, T>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2937,7 +3072,7 @@ impl<'a, R: RawRwLock + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
+impl<'a, R: RawRwLockCore + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
     for MappedRwLockReadGuard<'a, R, T>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2946,7 +3081,7 @@ impl<'a, R: RawRwLock + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
 }
 
 #[cfg(feature = "owning_ref")]
-unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> StableAddress
+unsafe impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> StableAddress
     for MappedRwLockReadGuard<'a, R, T>
 {
 }
@@ -2960,22 +3095,24 @@ unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> StableAddress
 /// thread.
 #[clippy::has_significant_drop]
 #[must_use = "if unused the RwLock will immediately unlock"]
-pub struct MappedRwLockWriteGuard<'a, R: RawRwLock, T: ?Sized> {
+pub struct MappedRwLockWriteGuard<'a, R: RawRwLockCore, T: ?Sized> {
     raw: &'a R,
     data: *mut T,
     marker: PhantomData<&'a mut T>,
 }
 
-unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + Sync + 'a> Sync
+unsafe impl<'a, R: RawRwLockCore + 'a, T: ?Sized + Sync + 'a> Sync
     for MappedRwLockWriteGuard<'a, R, T>
 {
 }
-unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + Send + 'a> Send for MappedRwLockWriteGuard<'a, R, T> where
-    R::GuardMarker: Send
+unsafe impl<'a, R: RawRwLockCore + 'a, T: ?Sized + Send + 'a> Send
+    for MappedRwLockWriteGuard<'a, R, T>
+where
+    R::GuardMarker: Send,
 {
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> MappedRwLockWriteGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> MappedRwLockWriteGuard<'a, R, T> {
     /// Make a new `MappedRwLockWriteGuard` for a component of the locked data.
     ///
     /// This operation cannot fail as the `MappedRwLockWriteGuard` passed
@@ -3082,7 +3219,7 @@ impl<'a, R: RawRwLockFair + 'a, T: ?Sized + 'a> MappedRwLockWriteGuard<'a, R, T>
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Deref for MappedRwLockWriteGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> Deref for MappedRwLockWriteGuard<'a, R, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -3090,14 +3227,14 @@ impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Deref for MappedRwLockWriteGuard<'a,
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> DerefMut for MappedRwLockWriteGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> DerefMut for MappedRwLockWriteGuard<'a, R, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data }
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Drop for MappedRwLockWriteGuard<'a, R, T> {
+impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> Drop for MappedRwLockWriteGuard<'a, R, T> {
     #[inline]
     fn drop(&mut self) {
         // Safety: A MappedRwLockWriteGuard always holds an exclusive lock.
@@ -3107,7 +3244,7 @@ impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> Drop for MappedRwLockWriteGuard<'a, 
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug
+impl<'a, R: RawRwLockCore + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug
     for MappedRwLockWriteGuard<'a, R, T>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -3115,7 +3252,7 @@ impl<'a, R: RawRwLock + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug
     }
 }
 
-impl<'a, R: RawRwLock + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
+impl<'a, R: RawRwLockCore + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
     for MappedRwLockWriteGuard<'a, R, T>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -3124,7 +3261,7 @@ impl<'a, R: RawRwLock + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
 }
 
 #[cfg(feature = "owning_ref")]
-unsafe impl<'a, R: RawRwLock + 'a, T: ?Sized + 'a> StableAddress
+unsafe impl<'a, R: RawRwLockCore + 'a, T: ?Sized + 'a> StableAddress
     for MappedRwLockWriteGuard<'a, R, T>
 {
 }

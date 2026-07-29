@@ -33,6 +33,89 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///
 /// Implementations of this trait must ensure that the mutex is actually
 /// exclusive: a lock can't be acquired while the mutex is already locked.
+pub unsafe trait RawMutexCore {
+    /// Marker type which determines whether a lock guard should be `Send`. Use
+    /// one of the `GuardSend` or `GuardNoSend` helper types here.
+    type GuardMarker;
+
+    /// Acquires this mutex, blocking the current thread until it is able to do so.
+    fn lock(&self);
+
+    /// Attempts to acquire this mutex without blocking. Returns `true`
+    /// if the lock was successfully acquired and `false` otherwise.
+    fn try_lock(&self) -> bool;
+
+    /// Unlocks this mutex.
+    ///
+    /// # Safety
+    ///
+    /// This method may only be called if the mutex is held in the current context, i.e. it must
+    /// be paired with a successful call to [`lock`], [`try_lock`], [`try_lock_for`] or [`try_lock_until`].
+    ///
+    /// [`lock`]: RawMutexCore::lock
+    /// [`try_lock`]: RawMutexCore::try_lock
+    /// [`try_lock_for`]: RawMutexTimed::try_lock_for
+    /// [`try_lock_until`]: RawMutexTimed::try_lock_until
+    unsafe fn unlock(&self);
+
+    /// Checks whether the mutex is currently locked.
+    #[inline]
+    fn is_locked(&self) -> bool {
+        let acquired_lock = self.try_lock();
+        if acquired_lock {
+            // Safety: The lock has been successfully acquired above.
+            unsafe {
+                self.unlock();
+            }
+        }
+        !acquired_lock
+    }
+}
+
+unsafe impl<R: RawMutex> RawMutexCore for R {
+    type GuardMarker = <Self as RawMutex>::GuardMarker;
+
+    fn lock(&self) {
+        <Self as RawMutex>::lock(self);
+    }
+
+    fn try_lock(&self) -> bool {
+        <Self as RawMutex>::try_lock(self)
+    }
+
+    unsafe fn unlock(&self) {
+        unsafe {
+            <Self as RawMutex>::unlock(self);
+        }
+    }
+
+    fn is_locked(&self) -> bool {
+        <Self as RawMutex>::is_locked(self)
+    }
+}
+
+/// Provides a constant default value for an unlocked mutex.
+pub unsafe trait RawMutexInit {
+    /// Initial value for an unlocked mutex.
+    // A “non-constant” const item is a legacy way to supply an initialized value to downstream
+    // static items. Can hopefully be replaced with `const fn new() -> Self` at some point.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const INIT: Self;
+}
+
+unsafe impl<R: RawMutex> RawMutexInit for R {
+    const INIT: Self = <Self as RawMutex>::INIT;
+}
+
+/// Basic operations for a mutex.
+///
+/// Types implementing this trait can be used by `Mutex` to form a safe and
+/// fully-functioning mutex type.
+///
+/// # Safety
+///
+/// Implementations of this trait must ensure that the mutex is actually
+/// exclusive: a lock can't be acquired while the mutex is already locked.
 pub unsafe trait RawMutex {
     /// Initial value for an unlocked mutex.
     // A “non-constant” const item is a legacy way to supply an initialized value to downstream
@@ -84,13 +167,13 @@ pub unsafe trait RawMutex {
 /// thread if there is one, without giving other threads the opportunity to
 /// "steal" the lock in the meantime. This is typically slower than unfair
 /// unlocking, but may be necessary in certain circumstances.
-pub unsafe trait RawMutexFair: RawMutex {
+pub unsafe trait RawMutexFair: RawMutexCore {
     /// Unlocks this mutex using a fair unlock protocol.
     ///
     /// # Safety
     ///
     /// This method may only be called if the mutex is held in the current context, see
-    /// the documentation of [`unlock`](RawMutex::unlock).
+    /// the documentation of [`unlock`](RawMutexCore::unlock).
     unsafe fn unlock_fair(&self);
 
     /// Temporarily yields the mutex to a waiting thread if there is one.
@@ -102,7 +185,7 @@ pub unsafe trait RawMutexFair: RawMutex {
     /// # Safety
     ///
     /// This method may only be called if the mutex is held in the current context, see
-    /// the documentation of [`unlock`](RawMutex::unlock).
+    /// the documentation of [`unlock`](RawMutexCore::unlock).
     unsafe fn bump(&self) {
         self.unlock_fair();
         self.lock();
@@ -113,7 +196,7 @@ pub unsafe trait RawMutexFair: RawMutex {
 ///
 /// The `Duration` and `Instant` types are specified as associated types so that
 /// this trait is usable even in `no_std` environments.
-pub unsafe trait RawMutexTimed: RawMutex {
+pub unsafe trait RawMutexTimed: RawMutexCore {
     /// Duration type used for `try_lock_for`.
     type Duration;
 
@@ -140,10 +223,10 @@ pub struct Mutex<R, T: ?Sized> {
     data: UnsafeCell<T>,
 }
 
-unsafe impl<R: RawMutex + Send, T: ?Sized + Send> Send for Mutex<R, T> {}
-unsafe impl<R: RawMutex + Sync, T: ?Sized + Send> Sync for Mutex<R, T> {}
+unsafe impl<R: RawMutexCore + Send, T: ?Sized + Send> Send for Mutex<R, T> {}
+unsafe impl<R: RawMutexCore + Sync, T: ?Sized + Send> Sync for Mutex<R, T> {}
 
-impl<R: RawMutex, T> Mutex<R, T> {
+impl<R: RawMutexInit, T> Mutex<R, T> {
     /// Creates a new mutex in an unlocked state ready for use.
     #[inline]
     pub const fn new(val: T) -> Mutex<R, T> {
@@ -152,7 +235,9 @@ impl<R: RawMutex, T> Mutex<R, T> {
             data: UnsafeCell::new(val),
         }
     }
+}
 
+impl<R: RawMutexCore, T> Mutex<R, T> {
     /// Consumes this mutex, returning the underlying data.
     #[inline]
     pub fn into_inner(self) -> T {
@@ -181,7 +266,7 @@ impl<R, T> Mutex<R, T> {
     }
 }
 
-impl<R: RawMutex, T: ?Sized> Mutex<R, T> {
+impl<R: RawMutexCore, T: ?Sized> Mutex<R, T> {
     /// Creates a new `MutexGuard` without checking if the mutex is locked.
     ///
     /// # Safety
@@ -268,7 +353,7 @@ impl<R: RawMutex, T: ?Sized> Mutex<R, T> {
 
     /// Returns the underlying raw mutex object.
     ///
-    /// Note that you will most likely need to import the `RawMutex` trait from
+    /// Note that you will most likely need to import the `RawMutexCore` trait from
     /// `lock_api` to be able to call functions on the raw mutex.
     ///
     /// # Safety
@@ -431,21 +516,21 @@ impl<R: RawMutexTimed, T: ?Sized> Mutex<R, T> {
     }
 }
 
-impl<R: RawMutex, T: ?Sized + Default> Default for Mutex<R, T> {
+impl<R: RawMutexInit, T: ?Sized + Default> Default for Mutex<R, T> {
     #[inline]
     fn default() -> Mutex<R, T> {
         Mutex::new(Default::default())
     }
 }
 
-impl<R: RawMutex, T> From<T> for Mutex<R, T> {
+impl<R: RawMutexInit, T> From<T> for Mutex<R, T> {
     #[inline]
     fn from(t: T) -> Mutex<R, T> {
         Mutex::new(t)
     }
 }
 
-impl<R: RawMutex, T: ?Sized + fmt::Debug> fmt::Debug for Mutex<R, T> {
+impl<R: RawMutexCore, T: ?Sized + fmt::Debug> fmt::Debug for Mutex<R, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.try_lock() {
             Some(guard) => f.debug_struct("Mutex").field("data", &&*guard).finish(),
@@ -469,7 +554,7 @@ impl<R: RawMutex, T: ?Sized + fmt::Debug> fmt::Debug for Mutex<R, T> {
 #[cfg(feature = "serde")]
 impl<R, T> Serialize for Mutex<R, T>
 where
-    R: RawMutex,
+    R: RawMutexCore,
     T: Serialize + ?Sized,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -483,7 +568,7 @@ where
 #[cfg(feature = "serde")]
 impl<'de, R, T> Deserialize<'de> for Mutex<R, T>
 where
-    R: RawMutex,
+    R: RawMutexInit,
     T: Deserialize<'de> + ?Sized,
 {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -501,14 +586,14 @@ where
 /// `Deref` and `DerefMut` implementations.
 #[clippy::has_significant_drop]
 #[must_use = "if unused the Mutex will immediately unlock"]
-pub struct MutexGuard<'a, R: RawMutex, T: ?Sized> {
+pub struct MutexGuard<'a, R: RawMutexCore, T: ?Sized> {
     mutex: &'a Mutex<R, T>,
     marker: PhantomData<(&'a mut T, R::GuardMarker)>,
 }
 
-unsafe impl<'a, R: RawMutex + Sync + 'a, T: ?Sized + Sync + 'a> Sync for MutexGuard<'a, R, T> {}
+unsafe impl<'a, R: RawMutexCore + Sync + 'a, T: ?Sized + Sync + 'a> Sync for MutexGuard<'a, R, T> {}
 
-impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> MutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> MutexGuard<'a, R, T> {
     /// Returns a reference to the original `Mutex` object.
     pub fn mutex(s: &Self) -> &'a Mutex<R, T> {
         s.mutex
@@ -683,7 +768,7 @@ impl<'a, R: RawMutexFair + 'a, T: ?Sized + 'a> MutexGuard<'a, R, T> {
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> Deref for MutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> Deref for MutexGuard<'a, R, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -691,14 +776,14 @@ impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> Deref for MutexGuard<'a, R, T> {
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> DerefMut for MutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> DerefMut for MutexGuard<'a, R, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.mutex.data.get() }
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> Drop for MutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> Drop for MutexGuard<'a, R, T> {
     #[inline]
     fn drop(&mut self) {
         // Safety: A MutexGuard always holds the lock.
@@ -708,20 +793,22 @@ impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> Drop for MutexGuard<'a, R, T> {
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug for MutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug for MutexGuard<'a, R, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display for MutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
+    for MutexGuard<'a, R, T>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (**self).fmt(f)
     }
 }
 
 #[cfg(feature = "owning_ref")]
-unsafe impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> StableAddress for MutexGuard<'a, R, T> {}
+unsafe impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> StableAddress for MutexGuard<'a, R, T> {}
 
 /// An RAII mutex guard returned by the `Arc` locking operations on `Mutex`.
 ///
@@ -730,24 +817,24 @@ unsafe impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> StableAddress for MutexGuard<'
 #[cfg(feature = "arc_lock")]
 #[clippy::has_significant_drop]
 #[must_use = "if unused the Mutex will immediately unlock"]
-pub struct ArcMutexGuard<R: RawMutex, T: ?Sized> {
+pub struct ArcMutexGuard<R: RawMutexCore, T: ?Sized> {
     mutex: Arc<Mutex<R, T>>,
     marker: PhantomData<*const ()>,
 }
 
 #[cfg(feature = "arc_lock")]
-unsafe impl<R: RawMutex + Send + Sync, T: Send + ?Sized> Send for ArcMutexGuard<R, T> where
+unsafe impl<R: RawMutexCore + Send + Sync, T: Send + ?Sized> Send for ArcMutexGuard<R, T> where
     R::GuardMarker: Send
 {
 }
 #[cfg(feature = "arc_lock")]
-unsafe impl<R: RawMutex + Sync, T: Sync + ?Sized> Sync for ArcMutexGuard<R, T> where
+unsafe impl<R: RawMutexCore + Sync, T: Sync + ?Sized> Sync for ArcMutexGuard<R, T> where
     R::GuardMarker: Sync
 {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawMutex, T: ?Sized> ArcMutexGuard<R, T> {
+impl<R: RawMutexCore, T: ?Sized> ArcMutexGuard<R, T> {
     /// Returns a reference to the `Mutex` this is guarding, contained in its `Arc`.
     #[inline]
     pub fn mutex(s: &Self) -> &Arc<Mutex<R, T>> {
@@ -838,7 +925,7 @@ impl<R: RawMutexFair, T: ?Sized> ArcMutexGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawMutex, T: ?Sized> Deref for ArcMutexGuard<R, T> {
+impl<R: RawMutexCore, T: ?Sized> Deref for ArcMutexGuard<R, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -847,7 +934,7 @@ impl<R: RawMutex, T: ?Sized> Deref for ArcMutexGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawMutex, T: ?Sized> DerefMut for ArcMutexGuard<R, T> {
+impl<R: RawMutexCore, T: ?Sized> DerefMut for ArcMutexGuard<R, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.mutex.data.get() }
@@ -855,7 +942,7 @@ impl<R: RawMutex, T: ?Sized> DerefMut for ArcMutexGuard<R, T> {
 }
 
 #[cfg(feature = "arc_lock")]
-impl<R: RawMutex, T: ?Sized> Drop for ArcMutexGuard<R, T> {
+impl<R: RawMutexCore, T: ?Sized> Drop for ArcMutexGuard<R, T> {
     #[inline]
     fn drop(&mut self) {
         // Safety: A MutexGuard always holds the lock.
@@ -874,22 +961,22 @@ impl<R: RawMutex, T: ?Sized> Drop for ArcMutexGuard<R, T> {
 /// thread.
 #[clippy::has_significant_drop]
 #[must_use = "if unused the Mutex will immediately unlock"]
-pub struct MappedMutexGuard<'a, R: RawMutex, T: ?Sized> {
+pub struct MappedMutexGuard<'a, R: RawMutexCore, T: ?Sized> {
     raw: &'a R,
     data: *mut T,
     marker: PhantomData<&'a mut T>,
 }
 
-unsafe impl<'a, R: RawMutex + Sync + 'a, T: ?Sized + Sync + 'a> Sync
+unsafe impl<'a, R: RawMutexCore + Sync + 'a, T: ?Sized + Sync + 'a> Sync
     for MappedMutexGuard<'a, R, T>
 {
 }
-unsafe impl<'a, R: RawMutex + 'a, T: ?Sized + Send + 'a> Send for MappedMutexGuard<'a, R, T> where
+unsafe impl<'a, R: RawMutexCore + 'a, T: ?Sized + Send + 'a> Send for MappedMutexGuard<'a, R, T> where
     R::GuardMarker: Send
 {
 }
 
-impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> MappedMutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> MappedMutexGuard<'a, R, T> {
     /// Makes a new `MappedMutexGuard` for a component of the locked data.
     ///
     /// This operation cannot fail as the `MappedMutexGuard` passed
@@ -996,7 +1083,7 @@ impl<'a, R: RawMutexFair + 'a, T: ?Sized + 'a> MappedMutexGuard<'a, R, T> {
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> Deref for MappedMutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> Deref for MappedMutexGuard<'a, R, T> {
     type Target = T;
     #[inline]
     fn deref(&self) -> &T {
@@ -1004,14 +1091,14 @@ impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> Deref for MappedMutexGuard<'a, R, T> 
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> DerefMut for MappedMutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> DerefMut for MappedMutexGuard<'a, R, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data }
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> Drop for MappedMutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> Drop for MappedMutexGuard<'a, R, T> {
     #[inline]
     fn drop(&mut self) {
         // Safety: A MappedMutexGuard always holds the lock.
@@ -1021,13 +1108,15 @@ impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> Drop for MappedMutexGuard<'a, R, T> {
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug for MappedMutexGuard<'a, R, T> {
+impl<'a, R: RawMutexCore + 'a, T: fmt::Debug + ?Sized + 'a> fmt::Debug
+    for MappedMutexGuard<'a, R, T>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<'a, R: RawMutex + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
+impl<'a, R: RawMutexCore + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
     for MappedMutexGuard<'a, R, T>
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1036,4 +1125,4 @@ impl<'a, R: RawMutex + 'a, T: fmt::Display + ?Sized + 'a> fmt::Display
 }
 
 #[cfg(feature = "owning_ref")]
-unsafe impl<'a, R: RawMutex + 'a, T: ?Sized + 'a> StableAddress for MappedMutexGuard<'a, R, T> {}
+unsafe impl<'a, R: RawMutexCore + 'a, T: ?Sized + 'a> StableAddress for MappedMutexGuard<'a, R, T> {}
